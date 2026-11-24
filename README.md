@@ -56,6 +56,7 @@ pnpm build   # compile to dist/
 | function or constant | RFC Section |
 | --- | --- |
 | `getWebsocketFrame` | [RFC 6455 5.2 Base Framing Protocol](https://datatracker.ietf.org/doc/html/rfc6455#section-5.2) |
+| `readWebsocketFrame` | [RFC 6455 5.2 Base Framing Protocol](https://datatracker.ietf.org/doc/html/rfc6455#section-5.2) |
 | `OPCODES` | [RFC 6455 5.2 Base Framing Protocol (Opcode)](https://datatracker.ietf.org/doc/html/rfc6455#section-5.2) |
 | `calMaskAndPayloadLengthBytes` | [RFC 6455 5.2 Base Framing Protocol (Payload length)](https://datatracker.ietf.org/doc/html/rfc6455#section-5.2) |
 | `maskPayloadData` | [RFC 6455 5.3 Client-to-Server Masking](https://datatracker.ietf.org/doc/html/rfc6455#section-5.3) |
