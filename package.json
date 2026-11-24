@@ -1,0 +1,35 @@
+{
+  "name": "http-utils",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Shared HTTP/2 and WebSocket frame utilities for http2-conformance-tests and http-sandbox",
+  "type": "module",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    "./http2": {
+      "types": "./dist/http2Utils.d.ts",
+      "default": "./dist/http2Utils.js"
+    },
+    "./websocket": {
+      "types": "./dist/websocketUtils.d.ts",
+      "default": "./dist/websocketUtils.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "dev": "tsc -p tsconfig.build.json --watch",
+    "check": "tsc -p tsconfig.json",
+    "test": "tsx --test src/*.test.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.1",
+    "tsx": "^4.23.15",
+    "typescript": "^6.0.3"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}

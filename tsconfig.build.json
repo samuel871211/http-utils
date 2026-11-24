@@ -1,0 +1,8 @@
+{
+  // build 用：排除測試檔並輸出到 dist（VS Code 與 pnpm check 用的是 tsconfig.json）
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false
+  },
+  "exclude": ["src/**/*.test.ts"]
+}
