@@ -9,6 +9,7 @@ import {
   maskPayloadData,
   readWebsocketFrame,
 } from "./websocketUtils.js";
+import { readUntil } from "./utils.js";
 
 const MAX_UINT64 = 2n ** 64n - 1n;
 
@@ -835,6 +836,26 @@ describe("readWebsocketFrame", () => {
         const frame = await readWebsocketFrame(socket);
         assert.deepEqual(frame.raw, wire);
       }
+    });
+  });
+
+  describe("與 readUntil 搭配（handshake response 之後緊接著 frame）", () => {
+    it("handshake response 與第一個 frame 黏在同一個 chunk", TEST_TIMEOUT, async () => {
+      const response = Buffer.from(
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+      );
+      const payload = Buffer.from("Hello");
+      const wire = buildFrame({ payload });
+      const socket = await connect((s) => s.write(Buffer.concat([response, wire])));
+      const head = await readUntil({
+        socket,
+        delimiter: Buffer.from("\r\n\r\n"),
+        maxByteCount: 8192,
+      });
+      assert.deepEqual(head, response);
+      const frame = await readWebsocketFrame(socket);
+      assert.deepEqual(frame.payloadData, payload);
+      assert.deepEqual(frame.raw, wire);
     });
   });
 

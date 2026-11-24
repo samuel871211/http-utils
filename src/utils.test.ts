@@ -2,7 +2,7 @@ import { afterEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import net from "node:net";
 import { setTimeout as sleep } from "node:timers/promises";
-import { readExactly } from "./utils.js";
+import { readExactly, readUntil } from "./utils.js";
 
 const HOST = "127.0.0.1";
 // 任何一個測試卡住（Promise 永遠 pending）都會被這個 timeout 抓到
@@ -375,5 +375,245 @@ describe("readExactly", () => {
         assert.deepEqual(listenerCounts(socket), before);
       });
     }
+  });
+});
+
+describe("readUntil", () => {
+  const CRLF2 = Buffer.from("\r\n\r\n");
+  const ru = (socket: net.Socket, maxByteCount = 8192, delimiter = CRLF2) =>
+    readUntil({ socket, delimiter, maxByteCount });
+
+  describe("讀取成功", () => {
+    it("回傳到 delimiter 結尾為止（包含 delimiter）", TEST_TIMEOUT, async () => {
+      const head = Buffer.from("HTTP/1.1 101 Switching Protocols\r\nA: b\r\n\r\n");
+      const socket = await connect((s) => s.write(head));
+      assert.deepEqual(await ru(socket), head);
+    });
+
+    it("delimiter 在最開頭", TEST_TIMEOUT, async () => {
+      const socket = await connect((s) => s.write(CRLF2));
+      assert.deepEqual(await ru(socket), CRLF2);
+    });
+
+    it("多讀的 bytes 會放回 socket，readExactly 可以接著讀", TEST_TIMEOUT, async () => {
+      const head = Buffer.from("HTTP/1.1 101\r\n\r\n");
+      const rest = Buffer.from([1, 2, 3, 4, 5]);
+      const socket = await connect((s) => s.write(Buffer.concat([head, rest])));
+      assert.deepEqual(await ru(socket), head);
+      assert.deepEqual(
+        await readExactly({ socket, byteCount: 5, label: "bytes" }),
+        rest,
+      );
+    });
+
+    it("delimiter 剛好在 chunk 結尾（沒有多讀），之後的資料照常讀得到", TEST_TIMEOUT, async () => {
+      const head = Buffer.from("abc\r\n\r\n");
+      const socket = await connect(async (s) => {
+        s.write(head);
+        await sleep(50);
+        s.write(Buffer.from([9, 8]));
+      });
+      assert.deepEqual(await ru(socket), head);
+      assert.deepEqual(
+        await readExactly({ socket, byteCount: 2, label: "bytes" }),
+        Buffer.from([9, 8]),
+      );
+    });
+
+    it("有多個 delimiter 時只讀到第一個，第二個留給下一次呼叫", TEST_TIMEOUT, async () => {
+      const first = Buffer.from("a\r\n\r\n");
+      const second = Buffer.from("b\r\n\r\n");
+      const socket = await connect((s) => s.write(Buffer.concat([first, second])));
+      assert.deepEqual(await ru(socket), first);
+      assert.deepEqual(await ru(socket), second);
+    });
+
+    it("delimiter 被切在兩個 chunk 中間", TEST_TIMEOUT, async () => {
+      const head = Buffer.from("abc\r\n\r\n");
+      for (let cut = 1; cut < head.byteLength; cut++) {
+        const socket = await connect(async (s) => {
+          s.write(head.subarray(0, cut));
+          await sleep(20);
+          s.write(head.subarray(cut));
+        });
+        assert.deepEqual(await ru(socket), head, `cut = ${cut}`);
+      }
+    });
+
+    it("一次只送 1 byte", TEST_TIMEOUT, async () => {
+      const head = Buffer.from("HTTP/1.1 101\r\n\r\n");
+      const socket = await connect(async (s) => {
+        for (const byte of head) {
+          s.write(Buffer.from([byte]));
+          await sleep(2);
+        }
+      });
+      assert.deepEqual(await ru(socket), head);
+    });
+
+    it("資料與 FIN 同時到達，仍讀得到", TEST_TIMEOUT, async () => {
+      const head = Buffer.from("abc\r\n\r\n");
+      const socket = await connect((s) => s.end(head));
+      assert.deepEqual(await ru(socket), head);
+    });
+
+    it("delimiter 之後還有資料，且 server 已 FIN：多讀的 bytes 仍然讀得到", TEST_TIMEOUT, async () => {
+      const head = Buffer.from("abc\r\n\r\n");
+      const rest = Buffer.from([1, 2, 3]);
+      const socket = await connect((s) => s.end(Buffer.concat([head, rest])));
+      assert.deepEqual(await ru(socket), head);
+      assert.deepEqual(
+        await readExactly({ socket, byteCount: 3, label: "bytes" }),
+        rest,
+      );
+    });
+
+    it("delimiter 不是 CRLF2 也可以（單一 byte）", TEST_TIMEOUT, async () => {
+      const socket = await connect((s) => s.write(Buffer.from("abc\nrest")));
+      assert.deepEqual(
+        await ru(socket, 100, Buffer.from("\n")),
+        Buffer.from("abc\n"),
+      );
+    });
+  });
+
+  describe("maxByteCount", () => {
+    it("delimiter 剛好在 maxByteCount 結束", TEST_TIMEOUT, async () => {
+      const head = Buffer.from("abc\r\n\r\n"); // 7 bytes
+      const socket = await connect((s) => s.write(head));
+      assert.deepEqual(await ru(socket, 7), head);
+    });
+
+    it("delimiter 在 maxByteCount + 1 結束，reject", TEST_TIMEOUT, async () => {
+      const head = Buffer.from("abcd\r\n\r\n"); // 8 bytes
+      const socket = await connect((s) => s.write(head));
+      await assert.rejects(ru(socket, 7), /maxByteCount exceeded/);
+    });
+
+    it("剛好收滿 maxByteCount bytes 仍沒有 delimiter：立刻 reject，不再等下一個 byte", TEST_TIMEOUT, async () => {
+      const socket = await connect((s) => s.write(Buffer.alloc(50, 0x61)));
+      await assert.rejects(ru(socket, 50), /maxByteCount exceeded/);
+    });
+
+    it("一直沒有 delimiter，累積超過 maxByteCount 就 reject", TEST_TIMEOUT, async () => {
+      const socket = await connect(async (s) => {
+        for (let i = 0; i < 20; i++) {
+          s.write(Buffer.alloc(10, 0x61));
+          await sleep(2);
+        }
+      });
+      await assert.rejects(ru(socket, 50), /maxByteCount exceeded/);
+    });
+  });
+
+  describe("reject 的原因", () => {
+    it("沒有 delimiter 就 FIN，訊息帶上已收到的資料", TEST_TIMEOUT, async () => {
+      const socket = await connect((s) => s.end(Buffer.from("abc")));
+      await assert.rejects(ru(socket), /socket end.*abc/);
+    });
+
+    it("沒送任何資料就 FIN", TEST_TIMEOUT, async () => {
+      const socket = await connect((s) => s.end());
+      await assert.rejects(ru(socket), /socket end/);
+    });
+
+    it("end 事件已發生之後再讀，reject readableEnded", TEST_TIMEOUT, async () => {
+      const socket = await connect((s) => s.end(Buffer.from("a\r\n\r\n")));
+      await ru(socket);
+      await until(() => socket.readableEnded);
+      await assert.rejects(ru(socket), /readableEnded/);
+    });
+
+    it("等待過程中 client 自己 destroy", TEST_TIMEOUT, async () => {
+      const socket = await connect(() => {});
+      const promise = ru(socket);
+      setTimeout(() => socket.destroy(), 20);
+      await assert.rejects(promise, /socket close/);
+    });
+
+    it("等待過程中收到 RST", TEST_TIMEOUT, async () => {
+      const socket = await connect((s) => {
+        setTimeout(() => s.resetAndDestroy(), 50);
+      });
+      await assert.rejects(ru(socket), /ECONNRESET/);
+    });
+
+    it("socket 已 destroy 且 buffer 是空的", TEST_TIMEOUT, async () => {
+      const socket = await connect(() => {});
+      socket.destroy();
+      await closed(socket);
+      await assert.rejects(ru(socket), /socket not readable/);
+    });
+  });
+
+  describe("參數與前置條件（reject）", () => {
+    it("delimiter 是空 Buffer", async () => {
+      const socket = await connect(() => {});
+      await assert.rejects(ru(socket, 10, Buffer.alloc(0)), {
+        name: "AssertionError",
+      });
+    });
+
+    it("maxByteCount 不合法", async () => {
+      const socket = await connect(() => {});
+      for (const maxByteCount of [3, -1, 10.5, Number.NaN]) {
+        await assert.rejects(
+          ru(socket, maxByteCount),
+          { name: "AssertionError" },
+          `maxByteCount = ${maxByteCount}`,
+        );
+      }
+    });
+
+    it("socket 已有 'readable' / 'data' listener，或已 pause()", async () => {
+      const a = await connect(() => {});
+      a.on("readable", noop);
+      await assert.rejects(ru(a), { name: "AssertionError" });
+      const b = await connect(() => {});
+      b.on("data", noop);
+      await assert.rejects(ru(b), { name: "AssertionError" });
+      const c = await connect(() => {});
+      c.pause();
+      await assert.rejects(ru(c), { name: "AssertionError" });
+    });
+  });
+
+  describe("listener 清理", () => {
+    it("成功之後不會洩漏 listener", TEST_TIMEOUT, async () => {
+      const socket = await connect((s) => s.write(Buffer.from("a\r\n\r\nrest")));
+      const before = listenerCounts(socket);
+      await ru(socket);
+      assert.deepEqual(listenerCounts(socket), before);
+    });
+
+    for (const [name, server, setup] of [
+      ["socket end", (s: net.Socket) => void setTimeout(() => s.end(), 20), noop],
+      [
+        "socket close",
+        noop,
+        (socket: net.Socket) => void setTimeout(() => socket.destroy(), 20),
+      ],
+      [
+        "error（RST）",
+        (s: net.Socket) => void setTimeout(() => s.resetAndDestroy(), 20),
+        noop,
+      ],
+    ] as const) {
+      it(`${name} 之後不會洩漏 listener`, TEST_TIMEOUT, async () => {
+        const socket = await connect(server);
+        const before = listenerCounts(socket);
+        const promise = ru(socket);
+        setup(socket);
+        await assert.rejects(promise);
+        assert.deepEqual(listenerCounts(socket), before);
+      });
+    }
+
+    it("maxByteCount exceeded 之後不會洩漏 listener", TEST_TIMEOUT, async () => {
+      const socket = await connect((s) => s.write(Buffer.alloc(100, 0x61)));
+      const before = listenerCounts(socket);
+      await assert.rejects(ru(socket, 50), /maxByteCount exceeded/);
+      assert.deepEqual(listenerCounts(socket), before);
+    });
   });
 });

@@ -121,4 +121,135 @@ async function readExactly(params: {
   });
 }
 
-export { readExactly };
+/**
+ * 從 socket 讀取，直到累積的資料包含 `delimiter`（例如 HTTP header 結尾的 "\r\n\r\n"）
+ *
+ * 回傳的 `Buffer` 從第一個 byte 到 `delimiter` 結尾（包含 `delimiter`）。
+ * 讀過頭的 bytes（`delimiter` 之後的部分）會用 `socket.unshift()` 放回 socket，
+ * 之後的 {@link readExactly} 或 {@link readUntil} 可以接著讀。
+ *
+ * 呼叫前，須確保 socket 沒有註冊其他 "readable" 或 "data" event
+ *
+ * `maxByteCount`：`delimiter` 必須在前 `maxByteCount` bytes 內結束，否則 reject。
+ * reject 時，已經讀出的資料不會放回 socket。
+ *
+ * reject 的情況：
+ * - "readableEnded"：socket 的 "end" 已發生，沒有資料可讀
+ * - "socket not readable"：socket 不可再讀
+ * - "maxByteCount exceeded"：讀了 `maxByteCount` bytes 仍沒有找到 `delimiter`
+ * - "socket end" / "socket close"：等待資料期間 socket 結束或關閉
+ */
+async function readUntil(params: {
+  socket: Socket | TLSSocket,
+  delimiter: Buffer,
+  maxByteCount: number,
+}) {
+  const { socket, delimiter, maxByteCount } = params;
+  assert(delimiter.byteLength > 0);
+  assert(
+    Number.isInteger(maxByteCount) && maxByteCount >= delimiter.byteLength,
+  );
+  assert(socket.listenerCount("readable") === 0);
+  assert(socket.listenerCount("data") === 0);
+  assert(socket.readableFlowing === null);
+
+  return new Promise<Buffer>((resolve, reject) => {
+    if (socket.readableEnded) {
+      assert(socket.readableLength === 0);
+      reject(new Error(JSON.stringify({ reason: "readableEnded" })));
+      return;
+    }
+    let accumulated = Buffer.alloc(0);
+    function tryRead() {
+      const maybeChunk = socket.read();
+      if (maybeChunk === null) {
+        if (socket.readable) {
+          socket.once("readable", tryRead);
+          return;
+        }
+        cleanup();
+        reject(
+          new Error(
+            JSON.stringify({
+              reason: "socket not readable",
+              received: accumulated.toString("latin1"),
+            }),
+          ),
+        );
+        return;
+      }
+      assert(maybeChunk instanceof Buffer);
+      // delimiter 可能被切在兩個 chunk 中間，所以要從「舊資料的尾端往前 delimiter.byteLength - 1 個 byte」開始找
+      const searchFrom = Math.max(
+        0,
+        accumulated.byteLength - delimiter.byteLength + 1,
+      );
+      accumulated = Buffer.concat([accumulated, maybeChunk]);
+      const index = accumulated
+        .subarray(0, maxByteCount)
+        .indexOf(delimiter, searchFrom);
+      if (index !== -1) {
+        const end = index + delimiter.byteLength;
+        const remainder = accumulated.subarray(end);
+        cleanup();
+        // 必須在 "end" 事件發出之前呼叫（這裡是同步流程，所以安全）
+        if (remainder.byteLength > 0) socket.unshift(remainder);
+        resolve(accumulated.subarray(0, end));
+        return;
+      }
+      if (accumulated.byteLength >= maxByteCount) {
+        cleanup();
+        reject(
+          new Error(
+            JSON.stringify({
+              reason: "maxByteCount exceeded",
+              maxByteCount,
+              received: accumulated.toString("latin1"),
+            }),
+          ),
+        );
+        return;
+      }
+      // 這一輪的資料不夠，繼續讀（buffer 內可能還有資料，所以直接再讀一次）
+      tryRead();
+    }
+    function end() {
+      cleanup();
+      reject(
+        new Error(
+          JSON.stringify({
+            reason: "socket end",
+            received: accumulated.toString("latin1"),
+          }),
+        ),
+      );
+    }
+    function close() {
+      cleanup();
+      reject(
+        new Error(
+          JSON.stringify({
+            reason: "socket close",
+            received: accumulated.toString("latin1"),
+          }),
+        ),
+      );
+    }
+    function error(err: Error) {
+      cleanup();
+      reject(err);
+    }
+    function cleanup() {
+      socket.removeListener("readable", tryRead);
+      socket.removeListener("end", end);
+      socket.removeListener("close", close);
+      socket.removeListener("error", error);
+    }
+    socket.once("end", end);
+    socket.once("close", close);
+    socket.once("error", error);
+    tryRead();
+  });
+}
+
+export { readExactly, readUntil };
