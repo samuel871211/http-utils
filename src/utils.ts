@@ -1,8 +1,9 @@
 /**
- * 內部工具：不對外 export。
+ * 通用的 socket 讀取工具，HTTP/2 與 WebSocket 共用。
  *
- * package.json 的 "exports" 只開放 "./http2" 與 "./websocket"，
- * 且 `index.ts` 不 re-export 這個檔案，所以使用這個套件的人無法 import。
+ * 對外 export：
+ * - package.json 的 "exports" 有 "./utils"
+ * - `index.ts` 有 re-export
  */
 import type { Socket } from "node:net";
 import type { TLSSocket } from "node:tls";

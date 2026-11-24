@@ -16,6 +16,15 @@ pnpm build   # compile to dist/
 | `pnpm check` | Run the TypeScript type check        |
 | `pnpm test`  | Run `src/*.test.ts` with `node:test` |
 
+## Utils
+
+Import from `http-utils/utils`.
+
+| function | Description |
+| --- | --- |
+| `readExactly` | Read exactly `byteCount` bytes from a socket, without reading ahead |
+| `readUntil` | Read from a socket until a delimiter (for example `\r\n\r\n`), and put the bytes after the delimiter back with `socket.unshift()` |
+
 ## HTTP/2
 
 | function or constant | RFC Section |

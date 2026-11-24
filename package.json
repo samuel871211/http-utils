@@ -13,6 +13,10 @@
     "./websocket": {
       "types": "./dist/websocketUtils.d.ts",
       "default": "./dist/websocketUtils.js"
+    },
+    "./utils": {
+      "types": "./dist/utils.d.ts",
+      "default": "./dist/utils.js"
     }
   },
   "files": [
