@@ -1,5 +1,8 @@
 import assert from "node:assert";
 import { Buffer } from "node:buffer";
+import type { Socket } from "node:net";
+import type { TLSSocket } from "node:tls";
+import { readExactly } from "./utils.js";
 
 const OPCODES = {
     continuation: 0x00,
@@ -136,9 +139,111 @@ function maskPayloadData (params: {
     return maskedPayloadData;
 }
 
+export type WebsocketFrame = {
+	FIN: 0 | 1;
+	RSV1: 0 | 1;
+	RSV2: 0 | 1;
+	RSV3: 0 | 1;
+	opcode: OPCODE;
+	payloadLength: bigint;
+	/**
+	 * wire 上的原樣：`mask === 1` 時是 masked，
+	 * 需要明文時，用 {@link maskPayloadData} 搭配 `maskingKey` 還原（XOR 對稱）
+	 */
+	payloadData: Buffer;
+	raw: Buffer;
+} & (
+	| { mask: 0; maskingKey?: undefined }
+	| { mask: 1; maskingKey: Buffer } 
+);
+
+/**
+ * 呼叫前，須確保 socket 沒有註冊其他 "readable" 或 "data" event
+ *
+ * 只讀一個 Websocket Frame 就停止
+ *
+ * `payloadLength` 超過 1 GiB 時會 reject（上限由 {@link readExactly} 決定）
+ */
+async function readWebsocketFrame (socket: Socket | TLSSocket): Promise<WebsocketFrame> {
+    // 1. FIN, RSV1~3, opcode, MASK, Payload len (7 bits)
+    const firstTwoBytes = await readExactly({
+        socket,
+        byteCount: 2,
+        label: "frame header",
+    });
+    const firstByte = firstTwoBytes[0] as number;
+    const secondByte = firstTwoBytes[1] as number;
+    const FIN = ((firstByte >> 7) & 1) as 0 | 1;
+    const RSV1 = ((firstByte >> 6) & 1) as 0 | 1;
+    const RSV2 = ((firstByte >> 5) & 1) as 0 | 1;
+    const RSV3 = ((firstByte >> 4) & 1) as 0 | 1;
+    const opcode = (firstByte & 0x0f) as OPCODE;
+    const mask = ((secondByte >> 7) & 1) as 0 | 1;
+    const payloadLength7Bits = secondByte & 0x7f;
+
+    const extendedPayloadLengthByteCount = (() => {
+        if (payloadLength7Bits === 126) return 2;
+        if (payloadLength7Bits === 127) return 8;
+        return 0;
+    })();
+    const extendedPayloadLengthBytes = await readExactly({
+        socket,
+        byteCount: extendedPayloadLengthByteCount,
+        label: "extended payload length",
+    });
+    const payloadLength = (() => {
+        if (extendedPayloadLengthByteCount === 2) {
+            return BigInt(extendedPayloadLengthBytes.readUInt16BE());
+        }
+        if (extendedPayloadLengthByteCount === 8) {
+            return extendedPayloadLengthBytes.readBigUInt64BE();
+        }
+        return BigInt(payloadLength7Bits);
+    })();
+
+    // 3. Masking key (0 或 4 bytes)
+    const maskingKeyBytes = await readExactly({
+        socket,
+        byteCount: mask === 1 ? 4 : 0,
+        label: "masking key",
+    });
+
+    // 4. Payload data（wire 上的原樣，mask === 1 時是 masked）
+    const wirePayloadData = await readExactly({
+        socket,
+        byteCount: Number(payloadLength),
+        label: "frame payload",
+    });
+
+    const base = {
+        FIN,
+        RSV1,
+        RSV2,
+        RSV3,
+        opcode,
+        payloadLength,
+        raw: Buffer.concat([
+            firstTwoBytes,
+            extendedPayloadLengthBytes,
+            maskingKeyBytes,
+            wirePayloadData,
+        ]),
+    };
+    if (mask === 1) {
+        return {
+            ...base,
+            mask,
+            maskingKey: maskingKeyBytes,
+            payloadData: wirePayloadData,
+        };
+    }
+    return { ...base, mask, payloadData: wirePayloadData };
+}
+
 export {
     OPCODES,
     getWebsocketFrame,
     calMaskAndPayloadLengthBytes,
-    maskPayloadData
+    maskPayloadData,
+    readWebsocketFrame,
 }

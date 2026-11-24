@@ -3,6 +3,7 @@ import { Writable } from "stream";
 import { TLSSocket } from "tls";
 import type { Http2Session, Settings } from "http2";
 import assert from "assert";
+import { readExactly } from "./utils.js";
 
 /**
  * https://datatracker.ietf.org/doc/html/rfc9113#name-error-codes
@@ -1025,165 +1026,26 @@ export type Http2Frame = {
  *
  * 只讀一個 Http2 Frame 就停止
  */
-function readHttp2Frame(socket: Socket | TLSSocket) {
-  assert(socket.listenerCount("readable") === 0);
-  assert(socket.readableFlowing === null);
-
-  return new Promise<Http2Frame>((resolve, reject) => {
-    if (socket.readableEnded) {
-      assert(socket.readableLength === 0);
-      reject(new Error(JSON.stringify({ reason: "readableEnded" })));
-      return;
-    }
-    const http2Frame = {} as Http2Frame;
-    if (socket.destroyed) {
-      readFrameHeader();
-      return;
-    }
-    function readFrameHeader() {
-      const maybeFrameHeader = socket.read(9);
-      if (maybeFrameHeader === null) {
-        if (socket.readable) {
-          socket.once("readable", readFrameHeader);
-          return;
-        }
-        cleanup();
-        reject(
-          new Error(
-            JSON.stringify({
-              reason: "socket not readable",
-              data: socket.read(),
-            }),
-          ),
-        );
-        return;
-      }
-      assert(maybeFrameHeader instanceof Buffer);
-      assert(maybeFrameHeader.byteLength <= 9);
-      if (maybeFrameHeader.byteLength === 9) {
-        http2Frame.length = maybeFrameHeader.readUintBE(0, 3);
-        http2Frame.type = maybeFrameHeader[3] as number;
-        http2Frame.flags = maybeFrameHeader[4] as number;
-        http2Frame.streamID = maybeFrameHeader.readUInt32BE(5) & 0x7fffffff;
-        http2Frame.raw = maybeFrameHeader;
-        if (http2Frame.length === 0) {
-          http2Frame.payload = Buffer.alloc(0);
-          cleanup();
-          resolve(http2Frame);
-          return;
-        }
-        readFramePayload();
-        return;
-      } else if (maybeFrameHeader.byteLength < 9) {
-        cleanup();
-        reject(
-          new Error(
-            JSON.stringify({
-              reason: "insufficient frame header",
-              maybeFrameHeader,
-            }),
-          ),
-        );
-        return;
-      }
-
-      // else if (maybeFrameHeader.byteLength > 9) {
-      //   http2Frame.length = maybeFrameHeader.readUintBE(0, 3);
-      //   http2Frame.type = maybeFrameHeader[3] as number;
-      //   http2Frame.flags = maybeFrameHeader[4] as number;
-      //   http2Frame.streamID = maybeFrameHeader.readUInt32BE(5) & 0x7fffffff;
-      //   // 多讀到下一個 http2Frame，塞回 internal buffer
-      //   if (http2Frame.length === 0) {
-      //     http2Frame.payload = Buffer.alloc(0);
-      //     cleanup();
-      //     socket.unshift(maybeFrameHeader.subarray(9));
-      //     resolve(http2Frame);
-      //     return;
-      //   }
-      //   // 剛好讀完一個 http2Frame
-      //   if (http2Frame.length === maybeFrameHeader.byteLength - 9) {
-      //     http2Frame.payload = maybeFrameHeader.subarray(9);
-      //     cleanup();
-      //     resolve(http2Frame);
-      //     return;
-      //   }
-      //   // http2Frame payload 沒讀完
-      //   cleanup();
-      //   reject(new Error(JSON.stringify({ reason: "insufficient frame payload", maybeFrameHeader })));
-      //   return;
-      // }
-    }
-    function readFramePayload() {
-      const maybeFramePayload = socket.read(http2Frame.length);
-      if (maybeFramePayload === null) {
-        if (socket.readable) {
-          socket.once("readable", readFramePayload);
-          return;
-        }
-        cleanup();
-        reject(
-          new Error(
-            JSON.stringify({
-              reason: "socket not readable",
-              data: socket.read(),
-            }),
-          ),
-        );
-        return;
-      }
-      assert(maybeFramePayload instanceof Buffer);
-      assert(maybeFramePayload.byteLength <= http2Frame.length);
-      if (maybeFramePayload.byteLength === http2Frame.length) {
-        http2Frame.payload = maybeFramePayload;
-        http2Frame.raw = Buffer.concat([http2Frame.raw, maybeFramePayload]);
-        cleanup();
-        resolve(http2Frame);
-        return;
-      }
-      // else if (maybeFramePayload.byteLength > http2Frame.length) {
-      //   http2Frame.payload = maybeFramePayload.subarray(0, http2Frame.length);
-      //   socket.unshift(maybeFramePayload.subarray(http2Frame.length));
-      //   cleanup();
-      //   resolve(http2Frame);
-      //   return;
-      // }
-      else if (maybeFramePayload.byteLength < http2Frame.length) {
-        cleanup();
-        reject(
-          new Error(
-            JSON.stringify({
-              reason: "insufficient frame payload",
-              maybeFramePayload,
-            }),
-          ),
-        );
-        return;
-      }
-    }
-    function end() {
-      cleanup();
-      reject(new Error(JSON.stringify({ reason: "socket end", http2Frame })));
-    }
-    function close() {
-      cleanup();
-      reject(new Error(JSON.stringify({ reason: "socket close", http2Frame })));
-    }
-    function error(err: Error) {
-      cleanup();
-      reject(err);
-    }
-    function cleanup() {
-      socket.removeListener("readable", readFrameHeader);
-      socket.removeListener("readable", readFramePayload);
-      socket.removeListener("end", end);
-      socket.removeListener("close", close);
-      socket.removeListener("error", error);
-    }
-    socket.once("readable", readFrameHeader);
-    socket.once("end", end);
-    socket.once("close", close);
-    socket.once("error", error);
+async function readHttp2Frame(socket: Socket | TLSSocket): Promise<Http2Frame> {
+  const header = await readExactly({
+    socket,
+    byteCount: 9,
+    label: "frame header",
   });
+  const length = header.readUIntBE(0, 3);
+  const payload = await readExactly({
+    socket,
+    byteCount: length,
+    label: "frame payload",
+  });
+  return {
+    length,
+    type: header[3] as number,
+    flags: header[4] as number,
+    streamID: header.readUInt32BE(5) & 0x7fffffff,
+    payload,
+    raw: Buffer.concat([header, payload]),
+  };
 }
 
 /**

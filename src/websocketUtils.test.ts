@@ -1,10 +1,13 @@
-import { describe, it } from "node:test";
+import { afterEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
+import net from "node:net";
+import { setTimeout as sleep } from "node:timers/promises";
 import {
   OPCODES,
   calMaskAndPayloadLengthBytes,
   getWebsocketFrame,
   maskPayloadData,
+  readWebsocketFrame,
 } from "./websocketUtils.js";
 
 const MAX_UINT64 = 2n ** 64n - 1n;
@@ -591,6 +594,291 @@ describe("getWebsocketFrame", () => {
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, // Extended payload length (64-bit)
         0x61,                                           // Payload
       ]));
+    });
+  });
+});
+
+describe("readWebsocketFrame", () => {
+  const HOST = "127.0.0.1";
+  const TEST_TIMEOUT = { timeout: 3000 };
+  const noop = () => {};
+  const cleanups: Array<() => void> = [];
+
+  afterEach(() => {
+    while (cleanups.length) cleanups.pop()!();
+  });
+
+  /**
+   * 建立一個 server，client 連上之後由 `onConnection` 決定 server 端要怎麼寫入。
+   * 回傳 client socket，測試結束後會自動清理。
+   */
+  async function connect(onConnection: (serverSocket: net.Socket) => void) {
+    const server = net.createServer((serverSocket) => {
+      serverSocket.on("error", noop);
+      serverSocket.setNoDelay(true);
+      onConnection(serverSocket);
+    });
+    await new Promise<void>((resolve) => server.listen(0, HOST, resolve));
+    const { port } = server.address() as net.AddressInfo;
+    const socket = net.connect({ host: HOST, port });
+    socket.on("error", noop);
+    cleanups.push(() => {
+      socket.destroy();
+      server.close();
+    });
+    return socket;
+  }
+
+  /**
+   * 組出完整的 wire bytes（有 maskingKey 時會自動 mask payload）
+   */
+  function buildFrame(params: {
+    FIN?: 0 | 1;
+    RSV1?: 0 | 1;
+    RSV2?: 0 | 1;
+    RSV3?: 0 | 1;
+    opcode?: (typeof OPCODES)[keyof typeof OPCODES];
+    maskingKey?: Buffer;
+    payload: Buffer;
+  }) {
+    const { maskingKey, payload } = params;
+    return getWebsocketFrame({
+      FIN: params.FIN ?? 1,
+      RSV1: params.RSV1 ?? 0,
+      RSV2: params.RSV2 ?? 0,
+      RSV3: params.RSV3 ?? 0,
+      opcode: params.opcode ?? OPCODES.text,
+      ...(maskingKey ? { maskingKey } : {}),
+      maskAndPayloadLengthBytes: calMaskAndPayloadLengthBytes({
+        mask: maskingKey ? 1 : 0,
+        payloadLength: BigInt(payload.byteLength),
+      }),
+      payloadData: maskingKey
+        ? maskPayloadData({ maskingKey, payloadData: payload })
+        : payload,
+    });
+  }
+
+  const maskingKey = Buffer.from([0x37, 0xfa, 0x21, 0x3d]);
+
+  describe("欄位解析", () => {
+    it("unmasked text frame", TEST_TIMEOUT, async () => {
+      const payload = Buffer.from("Hello");
+      const wire = buildFrame({ payload });
+      const socket = await connect((s) => s.write(wire));
+      const frame = await readWebsocketFrame(socket);
+      assert.equal(frame.FIN, 1);
+      assert.equal(frame.RSV1, 0);
+      assert.equal(frame.RSV2, 0);
+      assert.equal(frame.RSV3, 0);
+      assert.equal(frame.opcode, OPCODES.text);
+      assert.equal(frame.mask, 0);
+      assert.equal(frame.maskingKey, undefined);
+      assert.equal(frame.payloadLength, 5n);
+      assert.deepEqual(frame.payloadData, payload);
+      assert.deepEqual(frame.raw, wire);
+    });
+
+    it("masked text frame：payloadData 維持 masked（與 raw 的 payload 部分相同）", TEST_TIMEOUT, async () => {
+      const payload = Buffer.from("Hello");
+      const wire = buildFrame({ payload, maskingKey });
+      const socket = await connect((s) => s.write(wire));
+      const frame = await readWebsocketFrame(socket);
+      assert.equal(frame.mask, 1);
+      assert.deepEqual(frame.maskingKey, maskingKey);
+      assert.deepEqual(frame.payloadData, wire.subarray(-5));
+      assert.notDeepEqual(frame.payloadData, payload);
+      assert.deepEqual(frame.raw, wire);
+      // 呼叫端需要明文時，自己用 maskPayloadData 還原
+      assert.deepEqual(
+        maskPayloadData({ maskingKey, payloadData: frame.payloadData }),
+        payload,
+      );
+    });
+
+    it("FIN、RSV1~3、opcode 各自獨立解析", TEST_TIMEOUT, async () => {
+      const wire = buildFrame({
+        FIN: 0,
+        RSV1: 1,
+        RSV2: 0,
+        RSV3: 1,
+        opcode: OPCODES.binary,
+        payload: Buffer.from([1, 2, 3]),
+      });
+      const socket = await connect((s) => s.write(wire));
+      const frame = await readWebsocketFrame(socket);
+      assert.equal(frame.FIN, 0);
+      assert.equal(frame.RSV1, 1);
+      assert.equal(frame.RSV2, 0);
+      assert.equal(frame.RSV3, 1);
+      assert.equal(frame.opcode, OPCODES.binary);
+    });
+
+    for (const [name, opcode] of Object.entries(OPCODES)) {
+      it(`opcode ${name}（0x${opcode.toString(16)}）`, TEST_TIMEOUT, async () => {
+        const wire = buildFrame({ opcode, payload: Buffer.alloc(0) });
+        const socket = await connect((s) => s.write(wire));
+        const frame = await readWebsocketFrame(socket);
+        assert.equal(frame.opcode, opcode);
+      });
+    }
+  });
+
+  describe("payload length 的三種編碼", () => {
+    for (const length of [0, 1, 125, 126, 127, 65535, 65536, 100_000]) {
+      it(`payloadLength = ${length}`, TEST_TIMEOUT, async () => {
+        const payload = Buffer.alloc(length);
+        for (let i = 0; i < length; i++) payload[i] = i % 251;
+        const wire = buildFrame({ payload });
+        const socket = await connect((s) => s.write(wire));
+        const frame = await readWebsocketFrame(socket);
+        assert.equal(frame.payloadLength, BigInt(length));
+        assert.equal(frame.payloadData.compare(payload), 0);
+        assert.equal(frame.raw.compare(wire), 0);
+      });
+    }
+
+    it("masked 且 payloadLength = 65536（8 bytes extended length + masking key）", TEST_TIMEOUT, async () => {
+      const payload = Buffer.alloc(65536, 0xab);
+      const wire = buildFrame({ payload, maskingKey });
+      const socket = await connect((s) => s.write(wire));
+      const frame = await readWebsocketFrame(socket);
+      assert.equal(frame.payloadLength, 65536n);
+      assert.equal(frame.payloadData.compare(wire.subarray(-65536)), 0);
+      assert.equal(
+        maskPayloadData({ maskingKey, payloadData: frame.payloadData }).compare(
+          payload,
+        ),
+        0,
+      );
+      assert.equal(frame.raw.compare(wire), 0);
+    });
+
+    /**
+     * 只送 header（FIN + binary，不 mask，64-bit 長度），不送 payload
+     */
+    function headerWithPayloadLength(payloadLength: bigint) {
+      const length = Buffer.alloc(8);
+      length.writeBigUInt64BE(payloadLength);
+      return Buffer.concat([Buffer.from([0x82, 127]), length]);
+    }
+    const GiB = 1024n ** 3n;
+
+    it("payloadLength = 1 GiB 在上限內：不會 reject byteCount too large（payload 沒送完時是 insufficient）", TEST_TIMEOUT, async () => {
+      const socket = await connect((s) => s.end(headerWithPayloadLength(GiB)));
+      await assert.rejects(
+        readWebsocketFrame(socket),
+        /insufficient frame payload|socket end/,
+      );
+    });
+
+    for (const [name, payloadLength] of [
+      ["1 GiB + 1", GiB + 1n],
+      ["2^53", 2n ** 53n],
+      ["2^64 - 1", 2n ** 64n - 1n],
+    ] as const) {
+      it(`payloadLength = ${name} 時 reject byteCount too large，且帶上上限`, TEST_TIMEOUT, async () => {
+        const socket = await connect((s) =>
+          s.write(headerWithPayloadLength(payloadLength)),
+        );
+        await assert.rejects(
+          readWebsocketFrame(socket),
+          new RegExp(`byteCount too large.*maxByteCount.*${GiB}`),
+        );
+      });
+    }
+  });
+
+  describe("frame 切分", () => {
+    it("一次只送 1 byte", TEST_TIMEOUT, async () => {
+      const payload = Buffer.from("Hello");
+      const wire = buildFrame({ payload, maskingKey });
+      const socket = await connect(async (s) => {
+        for (const byte of wire) {
+          s.write(Buffer.from([byte]));
+          await sleep(2);
+        }
+      });
+      const frame = await readWebsocketFrame(socket);
+      assert.deepEqual(
+        maskPayloadData({ maskingKey, payloadData: frame.payloadData }),
+        payload,
+      );
+      assert.deepEqual(frame.raw, wire);
+    });
+
+    it("header 與 payload 分開送", TEST_TIMEOUT, async () => {
+      const payload = Buffer.alloc(300, 0x61);
+      const wire = buildFrame({ payload });
+      const socket = await connect(async (s) => {
+        s.write(wire.subarray(0, 4)); // 2 bytes header + 2 bytes extended length
+        await sleep(50);
+        s.write(wire.subarray(4));
+      });
+      const frame = await readWebsocketFrame(socket);
+      assert.equal(frame.payloadLength, 300n);
+      assert.deepEqual(frame.payloadData, payload);
+    });
+
+    it("三個 frame 黏在同一個 chunk，依序讀出且不會多讀", TEST_TIMEOUT, async () => {
+      const frames = [
+        buildFrame({ opcode: OPCODES.text, payload: Buffer.from("a") }),
+        buildFrame({ opcode: OPCODES.ping, payload: Buffer.alloc(0) }),
+        buildFrame({
+          opcode: OPCODES.binary,
+          payload: Buffer.alloc(200, 1),
+          maskingKey,
+        }),
+      ];
+      const socket = await connect((s) => s.write(Buffer.concat(frames)));
+      for (const wire of frames) {
+        const frame = await readWebsocketFrame(socket);
+        assert.deepEqual(frame.raw, wire);
+      }
+    });
+  });
+
+  describe("對端結束連線", () => {
+    it("只送半個 header 就 FIN", TEST_TIMEOUT, async () => {
+      const socket = await connect((s) => s.end(Buffer.from([0x81])));
+      await assert.rejects(readWebsocketFrame(socket), /insufficient frame header/);
+    });
+
+    it("extended payload length 送一半就 FIN", TEST_TIMEOUT, async () => {
+      const socket = await connect((s) =>
+        s.end(Buffer.from([0x81, 126, 0x01])),
+      );
+      await assert.rejects(
+        readWebsocketFrame(socket),
+        /insufficient extended payload length/,
+      );
+    });
+
+    it("masking key 送一半就 FIN", TEST_TIMEOUT, async () => {
+      const socket = await connect((s) =>
+        s.end(Buffer.from([0x81, 0x85, 0x37, 0xfa])),
+      );
+      await assert.rejects(readWebsocketFrame(socket), /insufficient masking key/);
+    });
+
+    it("payload 送一半就 FIN", TEST_TIMEOUT, async () => {
+      const wire = buildFrame({ payload: Buffer.from("Hello") });
+      const socket = await connect((s) => s.end(wire.subarray(0, wire.length - 2)));
+      await assert.rejects(readWebsocketFrame(socket), /insufficient frame payload/);
+    });
+
+    it("沒送任何資料就 FIN", TEST_TIMEOUT, async () => {
+      const socket = await connect((s) => s.end());
+      await assert.rejects(readWebsocketFrame(socket), /socket end/);
+    });
+
+    it("server FIN 前送了兩個 frame，兩個都讀得到，第三次 reject", TEST_TIMEOUT, async () => {
+      const a = buildFrame({ payload: Buffer.from("a") });
+      const b = buildFrame({ payload: Buffer.from("b") });
+      const socket = await connect((s) => s.end(Buffer.concat([a, b])));
+      assert.deepEqual((await readWebsocketFrame(socket)).raw, a);
+      assert.deepEqual((await readWebsocketFrame(socket)).raw, b);
+      await assert.rejects(readWebsocketFrame(socket));
     });
   });
 });
