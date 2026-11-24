@@ -122,6 +122,14 @@ async function readExactly(params: {
 }
 
 /**
+ * `readUntil` 的 `maxByteCount` 預設值（64 KiB）
+ *
+ * 每次收到新資料，`readUntil` 都會複製整份累積的資料，所以上限不宜太大。
+ * 64 KiB 足以容納一般的 HTTP header（例如 WebSocket handshake response）。
+ */
+const DEFAULT_READ_UNTIL_MAX_BYTE_COUNT = 64 * 1024;
+
+/**
  * 從 socket 讀取，直到累積的資料包含 `delimiter`（例如 HTTP header 結尾的 "\r\n\r\n"）
  *
  * 回傳的 `Buffer` 從第一個 byte 到 `delimiter` 結尾（包含 `delimiter`）。
@@ -131,6 +139,7 @@ async function readExactly(params: {
  * 呼叫前，須確保 socket 沒有註冊其他 "readable" 或 "data" event
  *
  * `maxByteCount`：`delimiter` 必須在前 `maxByteCount` bytes 內結束，否則 reject。
+ * 預設值是 {@link DEFAULT_READ_UNTIL_MAX_BYTE_COUNT}（64 KiB）。
  * reject 時，已經讀出的資料不會放回 socket。
  *
  * reject 的情況：
@@ -142,9 +151,13 @@ async function readExactly(params: {
 async function readUntil(params: {
   socket: Socket | TLSSocket,
   delimiter: Buffer,
-  maxByteCount: number,
+  maxByteCount?: number,
 }) {
-  const { socket, delimiter, maxByteCount } = params;
+  const {
+    socket,
+    delimiter,
+    maxByteCount = DEFAULT_READ_UNTIL_MAX_BYTE_COUNT,
+  } = params;
   assert(delimiter.byteLength > 0);
   assert(
     Number.isInteger(maxByteCount) && maxByteCount >= delimiter.byteLength,

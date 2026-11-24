@@ -506,6 +506,30 @@ describe("readUntil", () => {
     });
   });
 
+  describe("maxByteCount 的預設值（64 KiB）", () => {
+    it("沒傳 maxByteCount：delimiter 在 64 KiB 結尾剛好結束，讀得到", TEST_TIMEOUT, async () => {
+      const head = Buffer.concat([
+        Buffer.alloc(64 * 1024 - CRLF2.byteLength, 0x61),
+        CRLF2,
+      ]);
+      const socket = await connect((s) => s.write(head));
+      const actual = await readUntil({ socket, delimiter: CRLF2 });
+      assert.equal(actual.compare(head), 0);
+    });
+
+    it("沒傳 maxByteCount：delimiter 超出 64 KiB，reject", TEST_TIMEOUT, async () => {
+      const head = Buffer.concat([
+        Buffer.alloc(64 * 1024 - CRLF2.byteLength + 1, 0x61),
+        CRLF2,
+      ]);
+      const socket = await connect((s) => s.write(head));
+      await assert.rejects(
+        readUntil({ socket, delimiter: CRLF2 }),
+        /maxByteCount exceeded.*65536/,
+      );
+    });
+  });
+
   describe("reject 的原因", () => {
     it("沒有 delimiter 就 FIN，訊息帶上已收到的資料", TEST_TIMEOUT, async () => {
       const socket = await connect((s) => s.end(Buffer.from("abc")));
