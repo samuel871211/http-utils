@@ -66,6 +66,11 @@ Import from `http-utils/utils`.
 | --- | --- |
 | `getWebsocketFrame` | [RFC 6455 5.2 Base Framing Protocol](https://datatracker.ietf.org/doc/html/rfc6455#section-5.2) |
 | `readWebsocketFrame` | [RFC 6455 5.2 Base Framing Protocol](https://datatracker.ietf.org/doc/html/rfc6455#section-5.2) |
+| `getMaskedTextFrame` | [RFC 6455 5.6 Data Frames](https://datatracker.ietf.org/doc/html/rfc6455#section-5.6) |
+| `getMaskedBinaryFrame` | [RFC 6455 5.6 Data Frames](https://datatracker.ietf.org/doc/html/rfc6455#section-5.6) |
+| `getMaskedCloseFrame` | [RFC 6455 5.5.1 Close](https://datatracker.ietf.org/doc/html/rfc6455#section-5.5.1) |
+| `getMaskedPingFrame` | [RFC 6455 5.5.2 Ping](https://datatracker.ietf.org/doc/html/rfc6455#section-5.5.2) |
+| `STATUS_CODES` | [RFC 6455 7.4.1 Defined Status Codes](https://datatracker.ietf.org/doc/html/rfc6455#section-7.4.1) |
 | `OPCODES` | [RFC 6455 5.2 Base Framing Protocol (Opcode)](https://datatracker.ietf.org/doc/html/rfc6455#section-5.2) |
 | `calMaskAndPayloadLengthBytes` | [RFC 6455 5.2 Base Framing Protocol (Payload length)](https://datatracker.ietf.org/doc/html/rfc6455#section-5.2) |
 | `maskPayloadData` | [RFC 6455 5.3 Client-to-Server Masking](https://datatracker.ietf.org/doc/html/rfc6455#section-5.3) |

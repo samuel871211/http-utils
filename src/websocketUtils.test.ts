@@ -4,7 +4,12 @@ import net from "node:net";
 import { setTimeout as sleep } from "node:timers/promises";
 import {
   OPCODES,
+  STATUS_CODES,
   calMaskAndPayloadLengthBytes,
+  getMaskedBinaryFrame,
+  getMaskedCloseFrame,
+  getMaskedPingFrame,
+  getMaskedTextFrame,
   getWebsocketFrame,
   maskPayloadData,
   readWebsocketFrame,
@@ -595,6 +600,255 @@ describe("getWebsocketFrame", () => {
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, // Extended payload length (64-bit)
         0x61,                                           // Payload
       ]));
+    });
+  });
+});
+
+describe("getMasked*Frame（valid 的 client => server frame）", () => {
+  // FIN = 1, RSV1~3 = 0, MASK = 1, masking key = 0x00 0x00 0x00 0x00
+  const zeroMaskingKey = [0x00, 0x00, 0x00, 0x00];
+
+  describe("getMaskedTextFrame", () => {
+    it("Hello", () => {
+      // prettier-ignore
+      assert.deepEqual(getMaskedTextFrame({ payloadData: "Hello" }), Buffer.from([
+        0x81,                         // FIN = 1 + opcode = text
+        0x85,                         // MASK = 1 + Payload len = 5
+        ...zeroMaskingKey,            // Masking-key
+        0x48, 0x65, 0x6c, 0x6c, 0x6f, // "Hello"
+      ]));
+    });
+
+    it("payloadData 是 Buffer 與 string 時，結果相同", () => {
+      assert.deepEqual(
+        getMaskedTextFrame({ payloadData: Buffer.from("Hello") }),
+        getMaskedTextFrame({ payloadData: "Hello" }),
+      );
+    });
+
+    it("string 以 UTF-8 編碼，payload length 是 byte 數", () => {
+      // prettier-ignore
+      assert.deepEqual(getMaskedTextFrame({ payloadData: "你好" }), Buffer.from([
+        0x81,
+        0x86,                                     // MASK = 1 + Payload len = 6
+        ...zeroMaskingKey,
+        0xe4, 0xbd, 0xa0, 0xe5, 0xa5, 0xbd,
+      ]));
+    });
+
+    it("不傳參數 => payload 為 0 bytes", () => {
+      assert.deepEqual(
+        getMaskedTextFrame(),
+        Buffer.from([0x81, 0x80, ...zeroMaskingKey]),
+      );
+    });
+
+    it("payloadLength = 126 => 16-bit extended payload length", () => {
+      const actual = getMaskedTextFrame({ payloadData: "a".repeat(126) });
+      // prettier-ignore
+      assert.deepEqual(actual.subarray(0, 8), Buffer.from([
+        0x81,
+        0xfe,       // MASK = 1 + Payload len = 126
+        0x00, 0x7e, // Extended payload length (16-bit)
+        ...zeroMaskingKey,
+      ]));
+      assert.equal(actual.length, 8 + 126);
+    });
+  });
+
+  describe("getMaskedBinaryFrame", () => {
+    it("payload 為 [1, 2, 3]", () => {
+      // prettier-ignore
+      assert.deepEqual(
+        getMaskedBinaryFrame({ payloadData: Buffer.from([1, 2, 3]) }),
+        Buffer.from([
+          0x82,              // FIN = 1 + opcode = binary
+          0x83,              // MASK = 1 + Payload len = 3
+          ...zeroMaskingKey,
+          0x01, 0x02, 0x03,
+        ]),
+      );
+    });
+
+    it("不傳參數 => payload 為 0 bytes", () => {
+      assert.deepEqual(
+        getMaskedBinaryFrame(),
+        Buffer.from([0x82, 0x80, ...zeroMaskingKey]),
+      );
+    });
+
+    it("payloadLength = 65536 => 64-bit extended payload length", () => {
+      const actual = getMaskedBinaryFrame({ payloadData: Buffer.alloc(65536) });
+      // prettier-ignore
+      assert.deepEqual(actual.subarray(0, 14), Buffer.from([
+        0x82,
+        0xff,                                           // MASK = 1 + Payload len = 127
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, // Extended payload length (64-bit)
+        ...zeroMaskingKey,
+      ]));
+      assert.equal(actual.length, 14 + 65536);
+    });
+  });
+
+  describe("getMaskedPingFrame", () => {
+    it("不傳參數 => payload 為 0 bytes", () => {
+      assert.deepEqual(
+        getMaskedPingFrame(),
+        Buffer.from([0x89, 0x80, ...zeroMaskingKey]),
+      );
+    });
+
+    it("applicationData 是 string", () => {
+      // prettier-ignore
+      assert.deepEqual(getMaskedPingFrame("Hello"), Buffer.from([
+        0x89,                         // FIN = 1 + opcode = ping
+        0x85,                         // MASK = 1 + Payload len = 5
+        ...zeroMaskingKey,
+        0x48, 0x65, 0x6c, 0x6c, 0x6f, // "Hello"
+      ]));
+    });
+
+    it("applicationData 是 Buffer", () => {
+      assert.deepEqual(
+        getMaskedPingFrame(Buffer.from([0xaa, 0xbb])),
+        Buffer.from([0x89, 0x82, ...zeroMaskingKey, 0xaa, 0xbb]),
+      );
+    });
+
+    it("applicationData = 125 bytes（上限）", () => {
+      const actual = getMaskedPingFrame(Buffer.alloc(125));
+      assert.equal(actual.readUInt8(1), 0xfd); // MASK = 1 + Payload len = 125
+      assert.equal(actual.length, 2 + 4 + 125);
+    });
+
+    it("applicationData = 126 bytes 會 throw", () => {
+      assert.throws(
+        () => getMaskedPingFrame(Buffer.alloc(126)),
+        /applicationData must <= 125 bytes/,
+      );
+    });
+
+    it("applicationData 以 byte 數計算，不是字元數", () => {
+      assert.throws(
+        () => getMaskedPingFrame("你".repeat(42)), // 126 bytes
+        /applicationData must <= 125 bytes/,
+      );
+    });
+  });
+
+  describe("getMaskedCloseFrame", () => {
+    it("不傳參數 => payload 為 0 bytes", () => {
+      assert.deepEqual(
+        getMaskedCloseFrame(),
+        Buffer.from([0x88, 0x80, ...zeroMaskingKey]),
+      );
+    });
+
+    it("只有 statusCode", () => {
+      // prettier-ignore
+      assert.deepEqual(
+        getMaskedCloseFrame({ statusCode: STATUS_CODES.normalClosure }),
+        Buffer.from([
+          0x88,              // FIN = 1 + opcode = close
+          0x82,              // MASK = 1 + Payload len = 2
+          ...zeroMaskingKey,
+          0x03, 0xe8,        // Status code = 1000
+        ]),
+      );
+    });
+
+    it("statusCode 與 reason（string）", () => {
+      // prettier-ignore
+      assert.deepEqual(
+        getMaskedCloseFrame({ statusCode: 1001, reason: "bye" }),
+        Buffer.from([
+          0x88,
+          0x85,              // MASK = 1 + Payload len = 5
+          ...zeroMaskingKey,
+          0x03, 0xe9,        // Status code = 1001
+          0x62, 0x79, 0x65,  // "bye"
+        ]),
+      );
+    });
+
+    it("reason 是 Buffer 與 string 時，結果相同", () => {
+      assert.deepEqual(
+        getMaskedCloseFrame({ statusCode: 1000, reason: Buffer.from("bye") }),
+        getMaskedCloseFrame({ statusCode: 1000, reason: "bye" }),
+      );
+    });
+
+    it("reason = 123 bytes（上限）", () => {
+      const actual = getMaskedCloseFrame({
+        statusCode: 1000,
+        reason: Buffer.alloc(123),
+      });
+      assert.equal(actual.readUInt8(1), 0xfd); // MASK = 1 + Payload len = 125
+    });
+
+    it("reason = 124 bytes 會 throw", () => {
+      assert.throws(
+        () => getMaskedCloseFrame({ statusCode: 1000, reason: Buffer.alloc(124) }),
+        /reason must <= 123 bytes/,
+      );
+    });
+
+    it("reason 以 byte 數計算，不是字元數", () => {
+      assert.doesNotThrow(() =>
+        getMaskedCloseFrame({ statusCode: 1000, reason: "你".repeat(41) }), // 123 bytes
+      );
+      assert.throws(
+        () => getMaskedCloseFrame({ statusCode: 1000, reason: "你".repeat(41) + "a" }), // 124 bytes
+        /reason must <= 123 bytes/,
+      );
+    });
+
+    describe("statusCode", () => {
+      const sendable = [
+        1000, 1001, 1002, 1003, 1007, 1008, 1009, 1010, 1011, 1012, 1013, 1014,
+        3000, 3999, 4000, 4999,
+      ];
+      for (const statusCode of sendable) {
+        it(`${statusCode} 可以送`, () => {
+          const actual = getMaskedCloseFrame({ statusCode });
+          assert.equal(actual.readUInt16BE(6), statusCode);
+        });
+      }
+
+      const notSendable = [
+        0, 999, 1004, 1005, 1006, 1015, 1016, 2999, 5000, 65535, -1, 1000.5,
+      ];
+      for (const statusCode of notSendable) {
+        it(`${statusCode} 會 throw`, () => {
+          assert.throws(
+            () => getMaskedCloseFrame({ statusCode }),
+            /must not be sent in a close frame/,
+          );
+        });
+      }
+    });
+  });
+
+  describe("STATUS_CODES", () => {
+    it("對應 RFC 6455 Section 7.4.1 與 IANA registry", () => {
+      assert.deepEqual(STATUS_CODES, {
+        normalClosure: 1000,
+        goingAway: 1001,
+        protocolError: 1002,
+        unsupportedData: 1003,
+        reserved1004: 1004,
+        noStatusReceived: 1005,
+        abnormalClosure: 1006,
+        invalidFramePayloadData: 1007,
+        policyViolation: 1008,
+        messageTooBig: 1009,
+        mandatoryExtension: 1010,
+        internalError: 1011,
+        serviceRestart: 1012,
+        tryAgainLater: 1013,
+        badGateway: 1014,
+        tlsHandshake: 1015,
+      });
     });
   });
 });

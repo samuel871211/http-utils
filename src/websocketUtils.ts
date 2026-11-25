@@ -139,6 +139,152 @@ function maskPayloadData (params: {
     return maskedPayloadData;
 }
 
+/**
+ * RFC 6455 §7.4.1 + IANA WebSocket Close Code Number Registry
+ *
+ * 1004, 1005, 1006, 1015 保留給本機使用，不可出現在 wire 上
+ *
+ * 3000 ~ 3999: 給 library / framework 使用（IANA 註冊）
+ *
+ * 4000 ~ 4999: 給 application 私用
+ */
+const STATUS_CODES = {
+    normalClosure: 1000,
+    goingAway: 1001,
+    protocolError: 1002,
+    unsupportedData: 1003,
+
+    // reserved: 不可出現在 wire 上
+    reserved1004: 1004,
+    noStatusReceived: 1005,
+    abnormalClosure: 1006,
+
+    invalidFramePayloadData: 1007,
+    policyViolation: 1008,
+    messageTooBig: 1009,
+    mandatoryExtension: 1010,
+    internalError: 1011,
+    serviceRestart: 1012,
+    tryAgainLater: 1013,
+    badGateway: 1014,
+
+    // reserved: 不可出現在 wire 上
+    tlsHandshake: 1015,
+} as const;
+
+/**
+ * 可以出現在 close frame 上的 status code
+ */
+function isSendableStatusCode (statusCode: number): boolean {
+    if (!Number.isInteger(statusCode)) return false;
+    if (statusCode >= 1000 && statusCode <= 1014) {
+        return (
+            statusCode !== STATUS_CODES.reserved1004 &&
+            statusCode !== STATUS_CODES.noStatusReceived &&
+            statusCode !== STATUS_CODES.abnormalClosure
+        );
+    }
+    return statusCode >= 3000 && statusCode <= 4999;
+}
+
+function toBuffer (data?: Buffer | string): Buffer {
+    if (data === undefined) return Buffer.alloc(0);
+    return typeof data === "string" ? Buffer.from(data, "utf8") : data;
+}
+
+/**
+ * 產生 valid 的 client => server frame：
+ *
+ * - `FIN = 1`, `RSV1~3 = 0`
+ *
+ * - `mask = 1`, `maskingKey = 0x00 0x00 0x00 0x00`（讓輸出固定，payload 在 wire 上等於明文）
+ */
+function getMaskedFrame (params: {
+    opcode: OPCODE;
+    payloadData: Buffer;
+}): Buffer {
+    const { opcode, payloadData } = params;
+    const maskingKey = Buffer.alloc(4);
+    return getWebsocketFrame({
+        FIN: 1,
+        RSV1: 0,
+        RSV2: 0,
+        RSV3: 0,
+        opcode,
+        maskingKey,
+        maskAndPayloadLengthBytes: calMaskAndPayloadLengthBytes({
+            mask: 1,
+            payloadLength: BigInt(payloadData.byteLength),
+        }),
+        payloadData: maskPayloadData({ maskingKey, payloadData }),
+    });
+}
+
+/**
+ * - 不傳參數 => payload 為 0 bytes（valid）
+ *
+ * - 有 `reason` 就必須有 `statusCode`
+ *
+ * - `statusCode` 必須是 {@link isSendableStatusCode} 允許的值
+ *
+ * - `reason` 最多 123 bytes（control frame payload ≤ 125 bytes，扣掉 2 bytes 的 status code）
+ */
+function getMaskedCloseFrame (params?:
+    | { statusCode?: undefined; reason?: undefined }
+    | {
+        statusCode: number;
+        /**
+         * UTF-8-encoded
+         */
+        reason?: Buffer | string;
+    }
+): Buffer {
+    if (params?.statusCode === undefined) {
+        return getMaskedFrame({ opcode: OPCODES.close, payloadData: Buffer.alloc(0) });
+    }
+    const { statusCode } = params;
+    if (!isSendableStatusCode(statusCode)) {
+        throw new Error(`statusCode ${statusCode} must not be sent in a close frame`);
+    }
+    const reason = toBuffer(params.reason);
+    if (reason.byteLength > 123) {
+        throw new Error("reason must <= 123 bytes");
+    }
+    const statusCodeBytes = Buffer.alloc(2);
+    statusCodeBytes.writeUInt16BE(statusCode);
+    return getMaskedFrame({
+        opcode: OPCODES.close,
+        payloadData: Buffer.concat([statusCodeBytes, reason]),
+    });
+}
+/**
+ *
+ * @param applicationData 0 ~ 125 bytes
+ */
+function getMaskedPingFrame (applicationData?: Buffer | string): Buffer {
+    const payloadData = toBuffer(applicationData);
+    if (payloadData.byteLength > 125) {
+        throw new Error("applicationData must <= 125 bytes");
+    }
+    return getMaskedFrame({ opcode: OPCODES.ping, payloadData });
+}
+function getMaskedTextFrame (params?: {
+    payloadData?: Buffer | string;
+}): Buffer {
+    return getMaskedFrame({
+        opcode: OPCODES.text,
+        payloadData: toBuffer(params?.payloadData),
+    });
+}
+function getMaskedBinaryFrame (params?: {
+    payloadData?: Buffer;
+}): Buffer {
+    return getMaskedFrame({
+        opcode: OPCODES.binary,
+        payloadData: toBuffer(params?.payloadData),
+    });
+}
+
 export type WebsocketFrame = {
 	FIN: 0 | 1;
 	RSV1: 0 | 1;
@@ -242,7 +388,12 @@ async function readWebsocketFrame (socket: Socket | TLSSocket): Promise<Websocke
 
 export {
     OPCODES,
+    STATUS_CODES,
     getWebsocketFrame,
+    getMaskedCloseFrame,
+    getMaskedPingFrame,
+    getMaskedTextFrame,
+    getMaskedBinaryFrame,
     calMaskAndPayloadLengthBytes,
     maskPayloadData,
     readWebsocketFrame,
