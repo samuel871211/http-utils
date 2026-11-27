@@ -1,4 +1,4 @@
-# http-utils
+# yusheng-http-utils
 
 Shared TypeScript utilities for building, parsing, and testing raw HTTP/2 and WebSocket frames.
 
