@@ -18,8 +18,6 @@ pnpm build   # compile to dist/
 
 ## Utils
 
-Import from `http-utils/utils`.
-
 | function | Description |
 | --- | --- |
 | `readExactly` | Read exactly `byteCount` bytes from a socket, without reading ahead |
